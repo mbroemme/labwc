@@ -106,6 +106,17 @@ osd_on_view_destroy(struct view *view)
 		return;
 	}
 
+	/* Remove the dying view from the MRU history for this Alt-Tab session. */
+	if (osd_state->mru_cycle_inited) {
+		struct view **entry;
+		wl_array_for_each(entry, &osd_state->mru_cycle) {
+			if (*entry == view) {
+				/* Mark as gone; we skip NULLs when applying MRU. */
+				*entry = NULL;
+			}
+		}
+	}
+
 	if (osd_state->cycle_view == view) {
 		/*
 		 * If we are the current OSD selected view, cycle
@@ -162,13 +173,15 @@ restore_preview_node(struct server *server)
 		wlr_scene_node_reparent(osd_state->preview_node,
 			osd_state->preview_parent);
 
-		if (osd_state->preview_anchor) {
-			wlr_scene_node_place_above(osd_state->preview_node,
-				osd_state->preview_anchor);
-		} else {
-			/* Selected view was the first node */
-			wlr_scene_node_lower_to_bottom(osd_state->preview_node);
-		}
+		/* MRU behaviour during Alt-Tab:
+		 *
+		 * When a view stops being the currently selected item in the
+		 * window switcher, it becomes the "previous" one and should
+		 * end up in front of other normal views.  The newly selected
+		 * view is previewed in the always-on-top tree, so raising the
+		 * old one here does not hide the current selection.
+		 */
+		wlr_scene_node_raise_to_top(osd_state->preview_node);
 
 		/* Node was disabled / minimized before, disable again */
 		if (!osd_state->preview_was_enabled) {
@@ -188,16 +201,39 @@ restore_preview_node(struct server *server)
 void
 osd_begin(struct server *server, enum lab_cycle_dir direction)
 {
+	struct osd_state *osd_state = &server->osd_state;
+
 	if (server->input_mode != LAB_INPUT_STATE_PASSTHROUGH) {
 		return;
 	}
 
-	server->osd_state.cycle_view = get_next_cycle_view(server,
-		server->osd_state.cycle_view, direction);
+	osd_state->cycle_view = get_next_cycle_view(server,
+		osd_state->cycle_view, direction);
+
+	/* Start a new Alt-Tab session: reset MRU history */
+	if (!osd_state->mru_cycle_inited) {
+		wl_array_init(&osd_state->mru_cycle);
+		osd_state->mru_cycle_inited = true;
+	} else {
+		wl_array_release(&osd_state->mru_cycle);
+		wl_array_init(&osd_state->mru_cycle);
+	}
+	if (osd_state->cycle_view) {
+		array_add(&osd_state->mru_cycle, osd_state->cycle_view);
+	}
 
 	seat_focus_override_begin(&server->seat,
 		LAB_INPUT_STATE_WINDOW_SWITCHER, LAB_CURSOR_DEFAULT);
 	update_osd(server);
+
+	/* While the window switcher is active, move keyboard focus to the
+	 * currently selected view so Alt-Tab focuses windows immediately.
+	 * We pass raise=false here to avoid changing the stacking order
+	 * until the switcher is finished.
+	 */
+	if (osd_state->cycle_view) {
+		desktop_focus_view(osd_state->cycle_view, /*raise*/ false);
+	}
 
 	/* Update cursor, in case it is within the area covered by OSD */
 	cursor_update_focus(server);
@@ -206,11 +242,22 @@ osd_begin(struct server *server, enum lab_cycle_dir direction)
 void
 osd_cycle(struct server *server, enum lab_cycle_dir direction)
 {
+	struct osd_state *osd_state = &server->osd_state;
+
 	assert(server->input_mode == LAB_INPUT_STATE_WINDOW_SWITCHER);
 
-	server->osd_state.cycle_view = get_next_cycle_view(server,
-		server->osd_state.cycle_view, direction);
+	osd_state->cycle_view = get_next_cycle_view(server,
+		osd_state->cycle_view, direction);
+	if (osd_state->cycle_view && osd_state->mru_cycle_inited) {
+		array_add(&osd_state->mru_cycle, osd_state->cycle_view);
+	}
+
 	update_osd(server);
+
+	/* Keep keyboard focus in sync with the selected entry while cycling. */
+	if (osd_state->cycle_view) {
+		desktop_focus_view(osd_state->cycle_view, /*raise*/ false);
+	}
 }
 
 void
@@ -220,32 +267,55 @@ osd_finish(struct server *server, bool switch_focus)
 		return;
 	}
 
+	struct osd_state *osd_state = &server->osd_state;
+
 	restore_preview_node(server);
 	/* FIXME: this sets focus to the old surface even with switch_focus=true */
 	seat_focus_override_end(&server->seat);
 
-	struct view *cycle_view = server->osd_state.cycle_view;
-	server->osd_state.preview_node = NULL;
-	server->osd_state.preview_anchor = NULL;
-	server->osd_state.cycle_view = NULL;
-	server->osd_state.preview_was_shaded = false;
+	struct view *cycle_view = osd_state->cycle_view;
+	osd_state->preview_node = NULL;
+	osd_state->preview_anchor = NULL;
+	osd_state->cycle_view = NULL;
+	osd_state->preview_was_shaded = false;
 
 	destroy_osd_scenes(server);
 
-	if (server->osd_state.preview_outline) {
-		/* Destroy the whole multi_rect so we can easily react to new themes */
-		wlr_scene_node_destroy(&server->osd_state.preview_outline->tree->node);
-		server->osd_state.preview_outline = NULL;
+	if (osd_state->preview_outline) {
+		/* Destroy the whole multi_rect so we can easily react to new theme
+		 * changes */
+		wlr_scene_node_destroy(&osd_state->preview_outline->tree->node);
+		osd_state->preview_outline = NULL;
 	}
 
 	/* Hiding OSD may need a cursor change */
 	cursor_update_focus(server);
 
 	if (switch_focus && cycle_view) {
+		/* Apply full MRU stacking for all windows visited during this
+		 * Alt-Tab session so that the chosen window ends up on top and
+		 * the others follow in most-recently-used order.
+		 */
+		if (osd_state->mru_cycle_inited) {
+			struct view **entry;
+			wl_array_for_each(entry, &osd_state->mru_cycle) {
+				if (*entry && *entry != cycle_view) {
+					view_move_to_front(*entry);
+				}
+			}
+		}
+
 		if (rc.window_switcher.unshade) {
 			view_set_shade(cycle_view, false);
 		}
 		desktop_focus_view(cycle_view, /*raise*/ true);
+	}
+
+	/* MRU history is only valid for one Alt-Tab session; keep the
+	 * array allocated but forget its contents.
+	 */
+	if (osd_state->mru_cycle_inited) {
+		osd_state->mru_cycle.size = 0;
 	}
 }
 

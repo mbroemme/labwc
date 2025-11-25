@@ -309,6 +309,12 @@ struct server {
 		struct wlr_scene_tree *preview_parent;
 		struct wlr_scene_node *preview_anchor;
 		struct lab_scene_rect *preview_outline;
+
+		/* MRU history for the current Alt-Tab session (element type: struct view *) */
+		struct wl_array mru_cycle;
+
+		/* Whether mru_cycle has been initialised at least once */
+		bool mru_cycle_inited;
 	} osd_state;
 
 	struct theme *theme;

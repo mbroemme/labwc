@@ -74,11 +74,6 @@ desktop_focus_view(struct view *view, bool raise)
 		return;
 	}
 
-	if (view->server->input_mode == LAB_INPUT_STATE_WINDOW_SWITCHER) {
-		wlr_log(WLR_DEBUG, "not focusing window while window switching");
-		return;
-	}
-
 	if (view->minimized) {
 		/*
 		 * Unminimizing will map the view which triggers a call to this
@@ -110,7 +105,26 @@ desktop_focus_view(struct view *view, bool raise)
 	 * since view_move_to_front() raises all sibling views together.
 	 */
 	struct view *dialog = view_get_modal_dialog(view);
-	set_or_offer_focus(dialog ? dialog : view);
+	struct view *target = dialog ? dialog : view;
+	struct server *server = view->server;
+	enum input_mode old_mode = server->input_mode;
+
+	if (old_mode == LAB_INPUT_STATE_WINDOW_SWITCHER) {
+		/*
+		 * set_or_offer_focus() -> seat_focus_surface() normally refuses to
+		 * change focus when input_mode != LAB_INPUT_STATE_PASSTHROUGH.
+		 *
+		 * For the built-in window switcher (and foreign-toplevel-based
+		 * switchers which run while input_mode is WINDOW_SWITCHER) we *do*
+		 * want the selected view to receive focus immediately. Temporarily
+		 * switch back to PASSTHROUGH just for the focus operation.
+		 */
+		server->input_mode = LAB_INPUT_STATE_PASSTHROUGH;
+		set_or_offer_focus(target);
+		server->input_mode = old_mode;
+	} else {
+		set_or_offer_focus(target);
+	}
 }
 
 /* TODO: focus layer-shell surfaces also? */
